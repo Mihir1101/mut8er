@@ -2,16 +2,31 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
-
-	"mutation-tool/mutations"
-	"mutation-tool/utils"
 )
 
+// MutationRule defines a struct for mutation logic
+type MutationRule struct {
+	Original string
+	Mutant   string
+}
+
+// Predefined mutation rules
+var mutationRules = []MutationRule{
+	{"+", "-"},
+	{"-", "+"},
+	{">", "<"},
+	{"<", ">"},
+	{"*", "/"},
+	{"/", "*"},
+}
+
+var mutantsDir = "mutants"
+
+// Main entry point
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: mutant <path to foundry project>")
@@ -22,53 +37,48 @@ func main() {
 	contractsPath := filepath.Join(projectPath, "src")
 	fmt.Printf("Looking for contracts in: %s\n", contractsPath)
 
-	files := utils.GetSolidityFiles(contractsPath)
+	files := getSolidityFiles(contractsPath)
 	if len(files) == 0 {
 		fmt.Println("No Solidity files found in", contractsPath)
 		return
 	}
 
-	// Create a WaitGroup for concurrent execution of test runs
-	var wg sync.WaitGroup
-
-	// Channel to collect the results of tests
-	results := make(chan string)
-
-	// Create a separate file to log mutants that pass all tests
-	passFile, err := os.Create("mutants_passed.txt")
-	if err != nil {
-		fmt.Printf("Error creating pass file: %v\n", err)
-		return
-	}
-	defer passFile.Close()
-
-	// Process each file and test the mutants in parallel
 	for _, file := range files {
 		fmt.Printf("Processing file: %s\n", file)
-		err := processFile(file, projectPath, results, &wg)
+		err := processFile(file)
 		if err != nil {
 			fmt.Printf("Error processing file %s: %v\n", file, err)
 		}
 	}
 
-	// Wait for all goroutines to finish
-	wg.Wait()
-
-	// Close the results channel after all testing is done
-	close(results)
-
-	// Write the passed mutants to the file
-	for result := range results {
-		_, err := passFile.WriteString(result + "\n")
-		if err != nil {
-			fmt.Printf("Error writing to pass file: %v\n", err)
-		}
+	// Create mutants directory if it doesn't exist
+	if err := os.MkdirAll(mutantsDir, 0755); err != nil {
+		fmt.Printf("Error creating mutants directory: %v\n", err)
+		return
 	}
 }
 
-// processFile handles creating mutants and running tests concurrently
-func processFile(filePath, projectPath string, results chan<- string, wg *sync.WaitGroup) error {
-	originalCode, err := utils.ReadFile(filePath)
+// getSolidityFiles recursively finds all Solidity files in the directory
+func getSolidityFiles(rootPath string) []string {
+	var files []string
+	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if strings.HasSuffix(path, ".sol") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		fmt.Printf("Error walking through files: %v\n", err)
+	}
+	return files
+}
+
+// processFile handles creating mutants for a given Solidity file
+func processFile(filePath string) error {
+	originalCode, err := ioutil.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to read file: %v", err)
 	}
@@ -76,79 +86,82 @@ func processFile(filePath, projectPath string, results chan<- string, wg *sync.W
 	code := string(originalCode)
 	fmt.Printf("Read file: %s\n", filePath)
 
-	mutants := mutations.GenerateMutants(code, mutations.MutationRules)
+	mutants := generateMutants(code, mutationRules)
 	if len(mutants) == 0 {
 		fmt.Printf("No mutants created for %s\n", filePath)
 		return nil
 	}
 
-	// Launch a goroutine for each mutant to run the Foundry tests concurrently
 	for i, mutant := range mutants {
-		mutantFilePath := fmt.Sprintf("mutants/%s_mutant_%d.sol", strings.TrimSuffix(filepath.Base(filePath), ".sol"), i+1)
-		err := utils.WriteFile(mutantFilePath, []byte(mutant))
+		mutantFilePath := fmt.Sprintf("%s/%s_mutant_%d.sol", mutantsDir, strings.TrimSuffix(filepath.Base(filePath), ".sol"), i+1)
+		err := ioutil.WriteFile(mutantFilePath, []byte(mutant), 0644)
 		if err != nil {
 			fmt.Printf("Failed to write mutant file: %v\n", err)
 			continue
 		}
 		fmt.Printf("Mutant created: %s\n", mutantFilePath)
-
-		// Increment the WaitGroup counter
-		wg.Add(1)
-
-		// Run the tests in a separate goroutine
-		go runTests(filePath, mutantFilePath, projectPath, results, wg)
 	}
 
 	return nil
 }
 
-// runTests replaces the contract with the mutant and runs Foundry tests
-func runTests(originalContractPath, mutantFilePath, projectPath string, results chan<- string, wg *sync.WaitGroup) {
-	defer wg.Done()
+// generateMutants applies mutation rules to create all possible mutants of the code
+func generateMutants(code string, rules []MutationRule) []string {
+	lines := strings.Split(code, "\n")
+	var mutants []string
 
-	// Backup the original contract before replacing it
-	backupPath := originalContractPath + ".bak"
-	err := os.Rename(originalContractPath, backupPath)
-	if err != nil {
-		fmt.Printf("Error backing up contract: %v\n", err)
-		return
-	}
-	defer os.Rename(backupPath, originalContractPath) // Restore the original contract after test
+	for lineIndex, line := range lines {
+		// Skip irrelevant lines
+		if strings.HasPrefix(strings.TrimSpace(line), "//") || strings.HasPrefix(strings.TrimSpace(line), "pragma") || strings.Contains(line, "SPDX-License-Identifier") {
+			continue
+		}
 
-	// Replace the original contract with the mutant
-	err = os.Rename(mutantFilePath, originalContractPath)
-	if err != nil {
-		fmt.Printf("Error replacing contract with mutant: %v\n", err)
-		return
-	}
+		// Skip lines containing "++" or "--"
+		if strings.Contains(line, "++") || strings.Contains(line, "--") {
+			// Do not mutate lines with "++" or "--"
+			continue
+		}
 
-	// Change the working directory to the Foundry project directory
-	originalDir, err := os.Getwd()
-	if err != nil {
-		fmt.Printf("Error getting current directory: %v\n", err)
-		return
-	}
-	defer os.Chdir(originalDir) // Ensure we restore the original directory after tests
-
-	err = os.Chdir(projectPath)
-	if err != nil {
-		fmt.Printf("Error changing directory to project path: %v\n", err)
-		return
+		// Apply each mutation rule
+		for _, rule := range rules {
+			if strings.Contains(line, rule.Original) {
+				mutatedLine := strings.Replace(line, rule.Original, rule.Mutant, 1)
+				mutants = append(mutants, generateMutantTag(code, lineIndex, line, mutatedLine))
+			}
+		}
 	}
 
-	// Execute Foundry's test command (run from the foundry project directory)
-	cmd := exec.Command("forge", "test")
-	cmd.Dir = projectPath // Ensure we're running `forge test` in the Foundry project directory
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("Error running tests for mutant %s: %v\n", mutantFilePath, err)
-		return
-	}
+	return mutants
+}
 
-	// Check if tests passed (can be modified based on output)
-	if strings.Contains(string(output), "All tests passed!") {
-		results <- mutantFilePath
-	} else {
-		fmt.Printf("Tests failed for mutant %s\n", mutantFilePath)
+// generateMutantTag creates the tag for a mutated line to keep track of original and mutated versions
+func generateMutantTag(code string, lineIndex int, originalLine, mutatedLine string) string {
+	// Get the leading spaces from the original line
+	leadingSpaces := getLeadingSpaces(originalLine)
+
+	// Tagging the mutation with the original line and the mutated version
+	tag := fmt.Sprintf("%s// @mutant %s\n%s", leadingSpaces, originalLine[len(leadingSpaces):], mutatedLine)
+	return replaceLine(code, lineIndex, tag)
+}
+
+// getLeadingSpaces extracts the leading spaces from a line
+func getLeadingSpaces(line string) string {
+	// Count the number of leading spaces
+	leadingSpaces := ""
+	for _, char := range line {
+		if char == ' ' {
+			leadingSpaces += " "
+		} else {
+			break
+		}
 	}
+	return leadingSpaces
+}
+
+
+// replaceLine replaces a specific line in the code with a mutated version
+func replaceLine(code string, lineIndex int, newLine string) string {
+	lines := strings.Split(code, "\n")
+	lines[lineIndex] = newLine
+	return strings.Join(lines, "\n")
 }
