@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"regexp"
 )
 
 // MutationRule defines a struct for mutation logic
@@ -16,23 +17,43 @@ type MutationRule struct {
 	Mutant   string
 }
 
-// Predefined mutation rules
-var mutationRules = []MutationRule{
-	{"+", "-"},
-	{"-", "+"},
-	{">", "<"},
-	{"<", ">"},
-	{"*", "/"},
-	{"/", "*"},
+type MutantDetails struct {
+	OriginalLine string
+	MutatedLine  string
+	TestOutcome  string
+	RuleApplied  MutationRule
 }
 
-var mutantsDir = "mutants"
+type ContractMutationReport struct {
+	FileName         string
+	TotalMutants     int
+	PassedMutants    int
+	FailedMutants    int
+	MutantDetails    []MutantDetails
+}
+
+var (
+	mutationRules = []MutationRule{
+		{"+", "-"},
+		{"-", "+"},
+		{">", "<"},
+		{"<", ">"},
+		{"*", "/"},
+		{"/", "*"},
+	}
+	mutantsDir = "mutants"
+	reportDir  = "mutation_reports"
+	fileMutex  sync.Mutex
+)
 
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: mutant <path to foundry project>")
 		return
 	}
+
+	// Ensure report directory exists
+	os.MkdirAll(reportDir, os.ModePerm)
 
 	projectPath := os.Args[1]
 	contractsPath := filepath.Join(projectPath, "src")
@@ -44,20 +65,195 @@ func main() {
 		return
 	}
 
-	var wg sync.WaitGroup
+	var overallReports []ContractMutationReport
+	var reportMutex sync.Mutex
 
+	var wg sync.WaitGroup
 	for _, file := range files {
-		fmt.Printf("Processing file: %s\n", file)
 		wg.Add(1)
 		go func(filePath string) {
 			defer wg.Done()
-			if err := processFile(filePath, projectPath); err != nil {
-				fmt.Printf("Error processing file %s: %v\n", filePath, err)
-			}
+			report := processMutantsForFile(filePath, projectPath)
+			
+			reportMutex.Lock()
+			overallReports = append(overallReports, report)
+			reportMutex.Unlock()
+
+			// Generate Markdown report for this contract
+			generateMarkdownReport(report)
 		}(file)
 	}
 
 	wg.Wait()
+
+	// Generate an overall summary
+	generateOverallSummaryReport(overallReports)
+}
+
+func processMutantsForFile(filePath, projectPath string) ContractMutationReport {
+	originalCode, err := ioutil.ReadFile(filePath)
+	if err != nil {
+		fmt.Printf("Failed to read file %s: %v\n", filePath, err)
+		return ContractMutationReport{}
+	}
+
+	code := string(originalCode)
+	lines := strings.Split(code, "\n")
+	
+	report := ContractMutationReport{
+		FileName: filepath.Base(filePath),
+	}
+
+	var mutantDetailsList []MutantDetails
+	var mutantsMutex sync.Mutex
+	var wg sync.WaitGroup
+
+	for lineIndex, line := range lines {
+		// Skip irrelevant lines
+		if strings.HasPrefix(strings.TrimSpace(line), "//") || 
+			strings.HasPrefix(strings.TrimSpace(line), "pragma") || 
+			strings.Contains(line, "SPDX-License-Identifier") ||
+			strings.Contains(line, "++") || 
+			strings.Contains(line, "--") {
+			continue
+		}
+
+		for _, rule := range mutationRules {
+			if strings.Contains(line, rule.Original) {
+				wg.Add(1)
+				go func(lineIndex int, line string, rule MutationRule) {
+					defer wg.Done()
+
+					// Create mutant
+					mutatedLine := strings.Replace(line, rule.Original, rule.Mutant, 1)
+					mutantCode := replaceLine(code, lineIndex, mutatedLine)
+
+					// Test the mutant
+					fileMutex.Lock()
+					err := ioutil.WriteFile(filePath, []byte(mutantCode), 0644)
+					if err != nil {
+						fileMutex.Unlock()
+						return
+					}
+
+					cmd := exec.Command("forge", "test")
+					cmd.Dir = projectPath
+					output, _ := cmd.CombinedOutput()
+					
+					testSummary := extractTestSummary(string(output))
+					
+					// Restore original file
+					ioutil.WriteFile(filePath, originalCode, 0644)
+					fileMutex.Unlock()
+
+					// Create mutant details
+					mutantDetails := MutantDetails{
+						OriginalLine: line,
+						MutatedLine:  mutatedLine,
+						TestOutcome:  testSummary,
+						RuleApplied:  rule,
+					}
+
+					mutantsMutex.Lock()
+					mutantDetailsList = append(mutantDetailsList, mutantDetails)
+					mutantsMutex.Unlock()
+				}(lineIndex, line, rule)
+			}
+		}
+	}
+
+	wg.Wait()
+
+	// Populate report
+	report.TotalMutants = len(mutantDetailsList)
+	report.MutantDetails = mutantDetailsList
+	report.PassedMutants = countPassedMutants(mutantDetailsList)
+	report.FailedMutants = report.TotalMutants - report.PassedMutants
+
+	return report
+}
+
+func generateMarkdownReport(report ContractMutationReport) {
+	if report.TotalMutants == 0 {
+		return
+	}
+
+	// Create markdown content
+	markdownContent := fmt.Sprintf("# Mutation Testing Report for %s\n\n", report.FileName)
+	markdownContent += fmt.Sprintf("## Summary\n")
+	markdownContent += fmt.Sprintf("- **Total Mutants**: %d\n", report.TotalMutants)
+	markdownContent += fmt.Sprintf("- **Passed Mutants**: %d\n", report.PassedMutants)
+	markdownContent += fmt.Sprintf("- **Failed Mutants**: %d\n\n", report.FailedMutants)
+
+	markdownContent += "## Mutant Details\n\n"
+
+	for i, mutant := range report.MutantDetails {
+		markdownContent += fmt.Sprintf("### Mutant %d\n", i+1)
+		markdownContent += "#### Original Line\n"
+		markdownContent += fmt.Sprintf("```solidity\n%s\n```\n", mutant.OriginalLine)
+		markdownContent += "#### Mutated Line\n"
+		markdownContent += fmt.Sprintf("```solidity\n%s\n```\n", mutant.MutatedLine)
+		markdownContent += fmt.Sprintf("#### Mutation Rule\n")
+		markdownContent += fmt.Sprintf("- Original: `%s`\n", mutant.RuleApplied.Original)
+		markdownContent += fmt.Sprintf("- Mutant: `%s`\n", mutant.RuleApplied.Mutant)
+		markdownContent += fmt.Sprintf("#### Test Outcome: **%s**\n\n", mutant.TestOutcome)
+	}
+
+	// Write to file
+	reportPath := filepath.Join(reportDir, fmt.Sprintf("%s_mutation_report.md", 
+		strings.TrimSuffix(report.FileName, ".sol")))
+	
+	err := ioutil.WriteFile(reportPath, []byte(markdownContent), 0644)
+	if err != nil {
+		fmt.Printf("Error writing report for %s: %v\n", report.FileName, err)
+	}
+}
+
+func generateOverallSummaryReport(reports []ContractMutationReport) {
+	markdownContent := "# Overall Mutation Testing Summary\n\n"
+	markdownContent += "## Contract Mutation Statistics\n\n"
+
+	totalContracts := 0
+	totalMutants := 0
+	totalPassedMutants := 0
+	totalFailedMutants := 0
+
+	for _, report := range reports {
+		if report.TotalMutants > 0 {
+			totalContracts++
+			totalMutants += report.TotalMutants
+			totalPassedMutants += report.PassedMutants
+			totalFailedMutants += report.FailedMutants
+
+			markdownContent += fmt.Sprintf("### %s\n", report.FileName)
+			markdownContent += fmt.Sprintf("- Total Mutants: %d\n", report.TotalMutants)
+			markdownContent += fmt.Sprintf("- Passed Mutants: %d\n", report.PassedMutants)
+			markdownContent += fmt.Sprintf("- Failed Mutants: %d\n\n", report.FailedMutants)
+		}
+	}
+
+	markdownContent += "## Overall Summary\n"
+	markdownContent += fmt.Sprintf("- **Total Contracts Analyzed**: %d\n", totalContracts)
+	markdownContent += fmt.Sprintf("- **Total Mutants**: %d\n", totalMutants)
+	markdownContent += fmt.Sprintf("- **Total Passed Mutants**: %d\n", totalPassedMutants)
+	markdownContent += fmt.Sprintf("- **Total Failed Mutants**: %d\n", totalFailedMutants)
+
+	// Write overall summary
+	summaryPath := filepath.Join(reportDir, "mutation_testing_summary.md")
+	err := ioutil.WriteFile(summaryPath, []byte(markdownContent), 0644)
+	if err != nil {
+		fmt.Printf("Error writing overall summary: %v\n", err)
+	}
+}
+
+func countPassedMutants(mutants []MutantDetails) int {
+	passed := 0
+	for _, mutant := range mutants {
+		if mutant.TestOutcome == "PASS" {
+			passed++
+		}
+	}
+	return passed
 }
 
 // getSolidityFiles recursively finds all Solidity files in the directory
@@ -78,99 +274,23 @@ func getSolidityFiles(rootPath string) []string {
 	return files
 }
 
-// processFile handles creating and testing mutants for a given Solidity file
-func processFile(filePath, projectPath string) error {
-	originalCode, err := ioutil.ReadFile(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to read file: %v", err)
+// extractTestSummary extracts a simple pass/fail summary from the test output
+func extractTestSummary(output string) string {
+	// Match the line containing test result summary
+	re := regexp.MustCompile(`Suite result:.*(\d+) passed; (\d+) failed;.*`)
+	match := re.FindStringSubmatch(output)
+	if len(match) > 2 {
+		failed := match[2]
+
+		// If no tests failed, return PASS; otherwise, return FAIL
+		if failed == "0" {
+			return "MUTANT SURVIVED"
+		}
+		return "MUTANT GOT CAUGHT"
 	}
-
-	code := string(originalCode)
-	mutants := generateMutants(code, mutationRules)
-	if len(mutants) == 0 {
-		fmt.Printf("No mutants created for %s\n", filePath)
-		return nil
-	}
-
-	var wg sync.WaitGroup
-
-	for i, mutant := range mutants {
-		wg.Add(1)
-		go func(mutantCode string, index int) {
-			defer wg.Done()
-			fmt.Printf("Testing mutant %d for file: %s\n", index+1, filePath)
-			if err := testMutant(filePath, mutantCode, index+1, projectPath, originalCode); err != nil {
-				fmt.Printf("Error testing mutant %d: %v\n", index+1, err)
-			}
-		}(mutant, i)
-	}
-
-	wg.Wait()
-	return nil
+	return "UNKNOWN"
 }
 
-// testMutant replaces the file with a mutant, runs tests, and restores the original
-func testMutant(filePath string, mutant string, mutantNumber int,projectPath string, originalCode []byte) error {
-    // Backup the original file
-    backupPath := filePath + ".mutant"+ fmt.Sprint(mutantNumber) + ".backup"
-    if _, err := os.Stat(backupPath); os.IsNotExist(err) {
-        err = ioutil.WriteFile(backupPath, originalCode, 0644)
-        if err != nil {
-            return fmt.Errorf("failed to backup original file: %v", err)
-        }
-    }
-    fmt.Printf("Backup created: %s\n", backupPath)
-
-    // Replace the file with the mutant
-    err := ioutil.WriteFile(filePath, []byte(mutant), 0644)
-    if err != nil {
-        return fmt.Errorf("failed to write mutant to file: %v", err)
-    }
-
-    // Run tests
-    cmd := exec.Command("forge", "test")
-    cmd.Dir = projectPath
-    output, err := cmd.CombinedOutput()
-    fmt.Printf("Test output:\n%s\n", string(output))
-
-    // Restore the original file
-    restoreErr := os.Rename(backupPath, filePath)
-    if restoreErr != nil {
-        return fmt.Errorf("failed to restore original file: %v", restoreErr)
-    }
-
-    return err
-}
-
-
-// generateMutants applies mutation rules to create all possible mutants of the code
-func generateMutants(code string, rules []MutationRule) []string {
-	lines := strings.Split(code, "\n")
-	var mutants []string
-
-	for lineIndex, line := range lines {
-		// Skip irrelevant lines
-		if strings.HasPrefix(strings.TrimSpace(line), "//") || strings.HasPrefix(strings.TrimSpace(line), "pragma") || strings.Contains(line, "SPDX-License-Identifier") {
-			continue
-		}
-
-		// Skip lines containing "++" or "--"
-		if strings.Contains(line, "++") || strings.Contains(line, "--") {
-			// Do not mutate lines with "++" or "--"
-			continue
-		}
-
-		// Apply each mutation rule
-		for _, rule := range rules {
-			if strings.Contains(line, rule.Original) {
-				mutatedLine := strings.Replace(line, rule.Original, rule.Mutant, 1)
-				mutants = append(mutants, replaceLine(code, lineIndex, mutatedLine))
-			}
-		}
-	}
-
-	return mutants
-}
 
 // replaceLine replaces a specific line in the code with a mutated version
 func replaceLine(code string, lineIndex int, newLine string) string {
