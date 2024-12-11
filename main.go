@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"regexp"
+	"time"
 )
 
 // MutationRule defines a struct for mutation logic
@@ -40,6 +41,10 @@ var (
 		{"<", ">"},
 		{"*", "/"},
 		{"/", "*"},
+		{"==", "!="},
+		{"!=", "=="},
+		{"&&", "||"},
+		{"||", "&&"},
 	}
 	mutantsDir = "mutants"
 	reportDir  = "mutation_reports"
@@ -47,6 +52,7 @@ var (
 )
 
 func main() {
+	start := time.Now()
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: mutant <path to foundry project>")
 		return
@@ -88,6 +94,8 @@ func main() {
 
 	// Generate an overall summary
 	generateOverallSummaryReport(overallReports)
+	elapsed := time.Since(start)
+	fmt.Printf("Mutation testing completed in %s\n", elapsed)
 }
 
 func processMutantsForFile(filePath, projectPath string) ContractMutationReport {
@@ -112,9 +120,15 @@ func processMutantsForFile(filePath, projectPath string) ContractMutationReport 
 		// Skip irrelevant lines
 		if strings.HasPrefix(strings.TrimSpace(line), "//") || 
 			strings.HasPrefix(strings.TrimSpace(line), "pragma") || 
+			strings.HasPrefix(strings.TrimSpace(line), "import") ||
 			strings.Contains(line, "SPDX-License-Identifier") ||
 			strings.Contains(line, "++") || 
-			strings.Contains(line, "--") {
+			strings.Contains(line, "--") ||
+			strings.Contains(line, "+=") ||
+			strings.Contains(line, "-=") ||
+			strings.Contains(line, "*=") ||
+			strings.Contains(line, "/=") ||
+			strings.Contains(line, "//") {
 			continue
 		}
 
@@ -284,9 +298,9 @@ func extractTestSummary(output string) string {
 
 		// If no tests failed, return PASS; otherwise, return FAIL
 		if failed == "0" {
-			return "MUTANT SURVIVED"
+			return "PASS"
 		}
-		return "MUTANT GOT CAUGHT"
+		return "FAIL"
 	}
 	return "UNKNOWN"
 }
