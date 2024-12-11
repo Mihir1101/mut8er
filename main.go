@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // MutationRule defines a struct for mutation logic
@@ -26,7 +28,6 @@ var mutationRules = []MutationRule{
 
 var mutantsDir = "mutants"
 
-// Main entry point
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: mutant <path to foundry project>")
@@ -43,19 +44,20 @@ func main() {
 		return
 	}
 
+	var wg sync.WaitGroup
+
 	for _, file := range files {
 		fmt.Printf("Processing file: %s\n", file)
-		err := processFile(file)
-		if err != nil {
-			fmt.Printf("Error processing file %s: %v\n", file, err)
-		}
+		wg.Add(1)
+		go func(filePath string) {
+			defer wg.Done()
+			if err := processFile(filePath, projectPath); err != nil {
+				fmt.Printf("Error processing file %s: %v\n", filePath, err)
+			}
+		}(file)
 	}
 
-	// Create mutants directory if it doesn't exist
-	if err := os.MkdirAll(mutantsDir, 0755); err != nil {
-		fmt.Printf("Error creating mutants directory: %v\n", err)
-		return
-	}
+	wg.Wait()
 }
 
 // getSolidityFiles recursively finds all Solidity files in the directory
@@ -76,34 +78,70 @@ func getSolidityFiles(rootPath string) []string {
 	return files
 }
 
-// processFile handles creating mutants for a given Solidity file
-func processFile(filePath string) error {
+// processFile handles creating and testing mutants for a given Solidity file
+func processFile(filePath, projectPath string) error {
 	originalCode, err := ioutil.ReadFile(filePath)
 	if err != nil {
 		return fmt.Errorf("failed to read file: %v", err)
 	}
 
 	code := string(originalCode)
-	fmt.Printf("Read file: %s\n", filePath)
-
 	mutants := generateMutants(code, mutationRules)
 	if len(mutants) == 0 {
 		fmt.Printf("No mutants created for %s\n", filePath)
 		return nil
 	}
 
+	var wg sync.WaitGroup
+
 	for i, mutant := range mutants {
-		mutantFilePath := fmt.Sprintf("%s/%s_mutant_%d.sol", mutantsDir, strings.TrimSuffix(filepath.Base(filePath), ".sol"), i+1)
-		err := ioutil.WriteFile(mutantFilePath, []byte(mutant), 0644)
-		if err != nil {
-			fmt.Printf("Failed to write mutant file: %v\n", err)
-			continue
-		}
-		fmt.Printf("Mutant created: %s\n", mutantFilePath)
+		wg.Add(1)
+		go func(mutantCode string, index int) {
+			defer wg.Done()
+			fmt.Printf("Testing mutant %d for file: %s\n", index+1, filePath)
+			if err := testMutant(filePath, mutantCode, index+1, projectPath, originalCode); err != nil {
+				fmt.Printf("Error testing mutant %d: %v\n", index+1, err)
+			}
+		}(mutant, i)
 	}
 
+	wg.Wait()
 	return nil
 }
+
+// testMutant replaces the file with a mutant, runs tests, and restores the original
+func testMutant(filePath string, mutant string, mutantNumber int,projectPath string, originalCode []byte) error {
+    // Backup the original file
+    backupPath := filePath + ".mutant"+ fmt.Sprint(mutantNumber) + ".backup"
+    if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+        err = ioutil.WriteFile(backupPath, originalCode, 0644)
+        if err != nil {
+            return fmt.Errorf("failed to backup original file: %v", err)
+        }
+    }
+    fmt.Printf("Backup created: %s\n", backupPath)
+
+    // Replace the file with the mutant
+    err := ioutil.WriteFile(filePath, []byte(mutant), 0644)
+    if err != nil {
+        return fmt.Errorf("failed to write mutant to file: %v", err)
+    }
+
+    // Run tests
+    cmd := exec.Command("forge", "test")
+    cmd.Dir = projectPath
+    output, err := cmd.CombinedOutput()
+    fmt.Printf("Test output:\n%s\n", string(output))
+
+    // Restore the original file
+    restoreErr := os.Rename(backupPath, filePath)
+    if restoreErr != nil {
+        return fmt.Errorf("failed to restore original file: %v", restoreErr)
+    }
+
+    return err
+}
+
 
 // generateMutants applies mutation rules to create all possible mutants of the code
 func generateMutants(code string, rules []MutationRule) []string {
@@ -126,38 +164,13 @@ func generateMutants(code string, rules []MutationRule) []string {
 		for _, rule := range rules {
 			if strings.Contains(line, rule.Original) {
 				mutatedLine := strings.Replace(line, rule.Original, rule.Mutant, 1)
-				mutants = append(mutants, generateMutantTag(code, lineIndex, line, mutatedLine))
+				mutants = append(mutants, replaceLine(code, lineIndex, mutatedLine))
 			}
 		}
 	}
 
 	return mutants
 }
-
-// generateMutantTag creates the tag for a mutated line to keep track of original and mutated versions
-func generateMutantTag(code string, lineIndex int, originalLine, mutatedLine string) string {
-	// Get the leading spaces from the original line
-	leadingSpaces := getLeadingSpaces(originalLine)
-
-	// Tagging the mutation with the original line and the mutated version
-	tag := fmt.Sprintf("%s// @mutant %s\n%s", leadingSpaces, originalLine[len(leadingSpaces):], mutatedLine)
-	return replaceLine(code, lineIndex, tag)
-}
-
-// getLeadingSpaces extracts the leading spaces from a line
-func getLeadingSpaces(line string) string {
-	// Count the number of leading spaces
-	leadingSpaces := ""
-	for _, char := range line {
-		if char == ' ' {
-			leadingSpaces += " "
-		} else {
-			break
-		}
-	}
-	return leadingSpaces
-}
-
 
 // replaceLine replaces a specific line in the code with a mutated version
 func replaceLine(code string, lineIndex int, newLine string) string {
